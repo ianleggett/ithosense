@@ -1,0 +1,411 @@
+
+#define DEBUG_ESP_HTTP_CLIENT true
+#define DEBUG_ESP_PORT Serial
+
+
+#include <ESP8266WiFi.h>
+#include <DNSServer.h>
+#include <ESP8266WebServer.h>
+#include <WiFiManager.h>          //https://github.com/tzapu/WiFiManager
+#include <ESP8266HTTPClient.h>
+#include <Adafruit_Sensor.h>
+#include <SPI.h>
+#include <FS.h>
+#include <ArduinoJson.h>
+
+#define CFG_BUTT 10
+#define CFG_LED 14
+#define PIR_IN 4
+
+//#define USE_2320 true
+
+#ifdef USE_2320
+#include <AM2320.h>
+AM2320 am2320;
+#else
+#include <AM2321.h>
+AM2321 am2321;
+#endif
+
+#include <BH1750.h>
+
+#define BATT_ID "V"
+#define TEMP_ID "T"
+#define HUM_ID  "H"
+#define LUX_ID  "L"
+#define PIR_ID  "P"
+#define RST_ID  "R"  // reset event or crash
+#define CFG_ID  "CFG"
+
+#define CFX_ID  "CFX"
+
+#define HTTP_CODE_OK 200
+
+String ESP_ID = String("ESP") + String(ESP.getChipId(), HEX );
+
+ADC_MODE(ADC_VCC);
+
+WiFiServer server(80);
+
+//DHT dht(DHTPIN, DHTTYPE); // 11 works fine for ESP8266, 6=DHT11
+BH1750 lightMeter(0x23);
+
+static long loopCount = 0;
+long scanCount = 0;
+long clientCount = 0;
+boolean lastCfg,lastPir;
+//flag for saving data
+bool shouldSaveConfig = false;
+
+char server_url_str[128];
+char server_ip_str[40];
+char server_port_str[6];
+char node_id_str[20];
+
+void sleepWiFi(){
+   Serial.println("Wifi Sleeping...");
+   WiFi.mode(WIFI_OFF);
+   delay(500);
+}
+
+String getNodeID(char* paramType){
+  String str = String(paramType) + String(node_id_str);
+  return str;
+}
+
+void sendToEventServer(String devID,double event){
+
+  Serial.println("Sending Data..");
+
+  String portNum(server_port_str);
+
+  HTTPClient http;
+
+  const char *Tserver = "http://192.168.1.128/ithos/store.json?devid=0001&t=H&val=0.1234";
+  //const char *Tserver = "192.168.1.128";
+  const char *Turl = "/ithos/store.json?devid=0002&t=H&val=0.1234";
+  const char *Tfinger = "96:D0:2D:7D:F3:72:8B:CA:71:23:CA:B3:88:E4:F7:02:7F:DC:4A:88";
+
+  //http.begin("192.168.1.124",8080,"/WebReport/datastore");
+  //http.begin(server_ip_str,portNum.toInt(),server_url_str); //HTTP
+  http.begin("192.168.1.128",8443,"/ithos/store.json?devid=0001&t=H&val=0.1234",true,Tfinger);
+       // int httpCode = http.GET(); //json_String
+   // DynamicJsonBuffer jsonBuffer;
+   // JsonObject& node = jsonBuffer.createObject();
+   // node["devId"] = devID.c_str();
+   // node["dt"] = "2001-01-01T00:00:00";
+   // node["value"] = event;
+   // node["statusCode"] = 0;
+   // node.prettyPrintTo(Serial);
+  //
+   // char json_String[128];
+   // node.printTo( json_String, 128 );
+   // String payLoad = String(json_String);
+   // Serial.println( payLoad );
+
+  // aJsonObject* msg = aJson.createObject();
+  // aJson.addStringToObject(msg, "devId", devID.c_str());
+  // aJson.addStringToObject(msg, "dt", "1970-01-01");
+  // aJson.addNumberToObject(msg,"value", event);
+  // aJson.addStringToObject(msg,"statusCode","1");
+  // char *json_String=aJson.print(msg);
+  // String payLoad = String(json_String);
+  //
+  //Serial.println(json_String);
+
+  //http.addHeader("Content-Type","application/json;");
+
+    //int httpCode = http.POST(payLoad); //json_String
+    int httpCode = http.GET(); //json_String
+        // httpCode will be negative on error
+        if(httpCode > 0) {
+            // HTTP header has been send and Server response header has been handled
+            Serial.printf("[HTTP] ... code: %d\n", httpCode);
+            if(httpCode == HTTP_CODE_OK) {
+              String payload = http.getString();
+              Serial.println(payload);
+            }
+        }else{
+           Serial.printf("[HTTP] ... failed, error: %s\n", http.errorToString(httpCode).c_str());
+        }
+//   Serial.println("Sent code:"+String(httpCode));
+
+   http.end();
+
+}
+
+void readTemp(){
+  float t,h;
+  #ifdef USE_2320
+     if (am2320.measure()) {
+    t=am2320.getTemperature();
+    h=am2320.getHumidity();
+    Serial.print("(");
+    Serial.print(t);
+    Serial.print(", ");
+    Serial.print(h);
+    Serial.println(')');
+     }else{
+        int errorCode = am2320.getErrorCode();
+    switch (errorCode) {
+      case 1: Serial.println("ERR: Sensor is offline"); break;
+      case 2: Serial.println("ERR: CRC validation failed."); break;
+      }
+     }
+
+  #else
+
+    am2321.read();
+    t=am2321.temperature/10.0;
+    h=am2321.humidity/10.0;
+    Serial.print("(");
+    Serial.print(t);
+    Serial.print(", ");
+    Serial.print(h);
+    Serial.println(')');
+
+  #endif
+
+  sendToEventServer( getNodeID(TEMP_ID) ,t);
+  sendToEventServer( getNodeID(HUM_ID) ,h);
+
+}
+
+void doLightMeter(){
+
+  uint16_t lux = lightMeter.readLightLevel();
+
+   Serial.print(lux);
+   Serial.println(" lux");
+  sendToEventServer(getNodeID(LUX_ID),lux);
+}
+
+float checkBatt(){
+  float vcc = ESP.getVcc() / 1000.0 ;//readvdd33();
+  Serial.print("Batt ");
+  Serial.print(vcc);
+  Serial.println("V");
+  return vcc;
+}
+
+void doSleep(long sec){
+
+    Serial.println("Sleep ");
+
+    ESP.deepSleep( (sec-5) * 1000 * 1000); // 20 sec sleep-+
+    delay(1000);
+}
+
+void loop(void) {
+
+  int pir = digitalRead(PIR_IN);
+  digitalWrite(CFG_LED,!pir);
+  int cfg = !digitalRead(CFG_BUTT);
+
+  if (lastPir!=pir){
+    Serial.print("PIR:");
+    Serial.println(pir);
+    sendToEventServer(getNodeID(PIR_ID),pir);
+  }
+
+  if (cfg && !lastCfg){
+    boolean full = false;
+    int c = 0;
+    while(cfg && c<5000){
+      c++;
+      cfg = !digitalRead(CFG_BUTT);
+      delay(1);
+    }
+    if (c>=5000){
+      Serial.print("FULL CFG:");
+      Serial.println(cfg);
+      sendToEventServer(getNodeID(CFX_ID),cfg);
+      setUpWifi(true,true);
+    }else{
+      Serial.print("CFG:");
+      Serial.println(cfg);
+      sendToEventServer(getNodeID(CFG_ID),cfg);
+      setUpWifi(true,false);
+    }
+  }
+
+  lastPir = pir;
+  lastCfg = cfg;
+
+  if (scanCount > 60000){
+    for(int x=0;x<5;x++){
+        digitalWrite(CFG_LED,1);
+        delay(100);
+        digitalWrite(CFG_LED,0);
+        delay(10);
+    }
+
+    // every minute send results to server
+    float vcc = checkBatt();
+    sendToEventServer(getNodeID(BATT_ID),vcc);
+    readTemp();
+    doLightMeter();
+    scanCount = 0;
+
+  }
+
+  scanCount++;
+  delay(1);
+}
+
+void loadConfig(){
+  Serial.println("mounting FS...");
+  if (SPIFFS.begin()) {
+  Serial.println("mounted file system");
+  if (SPIFFS.exists("/config.json")) {
+    //file exists, reading and loading
+    Serial.println("reading config file");
+    File configFile = SPIFFS.open("/config.json", "r");
+    if (configFile) {
+      Serial.println("opened config file");
+      size_t size = configFile.size();
+      // Allocate a buffer to store contents of the file.
+      std::unique_ptr<char[]> buf(new char[size]);
+
+      configFile.readBytes(buf.get(), size);
+      DynamicJsonBuffer jsonBuffer;
+      JsonObject& json = jsonBuffer.parseObject(buf.get());
+      json.printTo(Serial);
+      if (json.success()) {
+        Serial.println("\nparsed json");
+
+        strcpy(server_ip_str, json["server_ip_str"]);
+        strcpy(server_url_str, json["server_url_str"]);
+        strcpy(server_port_str, json["server_port_str"]);
+        strcpy(node_id_str,json["node_id_str"]);
+
+      } else {
+        Serial.println("failed to load json config");
+      }
+    }
+  }
+} else {
+  Serial.println("failed to mount FS");
+}
+}
+
+//callback notifying us of the need to save config
+void saveConfigCallback () {
+  Serial.println("Should save config");
+  shouldSaveConfig = true;
+}
+
+void setUpWifi(boolean demand,boolean resetCfg){
+  //const char* connStr = demand ? "OnDemandAP" : "AutoConnectAP";
+  if (!resetCfg){
+    loadConfig();
+  }
+  WiFiManager wifiManager;
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+  WiFiManagerParameter node_id("nodeID", "node ID", node_id_str, 20);
+  WiFiManagerParameter server_ip("serverIP", "server ip", server_ip_str, 40);
+  WiFiManagerParameter server_url("serverURL", "server url", server_url_str, 128);
+  WiFiManagerParameter server_port("serverPort", "server port", server_port_str, 6);
+
+  wifiManager.addParameter(&node_id);
+  wifiManager.addParameter(&server_ip);
+  wifiManager.addParameter(&server_url);
+  wifiManager.addParameter(&server_port);
+
+  //reset settings - for testing
+  if (resetCfg){
+    wifiManager.resetSettings();
+  }
+
+  //sets timeout until configuration portal gets turned off
+  //useful to make it all retry or go to sleep
+  //in seconds
+  wifiManager.setTimeout(180);
+
+  //fetches ssid and pass and tries to connect
+  //if it does not connect it starts an access point with the specified name
+  //here using ESP chip ID
+  //and goes into a blocking loop awaiting configuration
+  if(!wifiManager.autoConnect(ESP_ID.c_str())) {
+    Serial.println("failed to connect and hit timeout");
+    delay(3000);
+    //reset and try again, or maybe put it to deep sleep
+    ESP.reset();
+    delay(5000);
+  }
+
+  //if you get here you have connected to the WiFi
+  Serial.println("connected...yeey :)");
+
+  strcpy(server_ip_str, server_ip.getValue());
+  strcpy(server_url_str, server_url.getValue());
+  strcpy(server_port_str, server_port.getValue());
+  strcpy(node_id_str, node_id.getValue());
+
+  if (shouldSaveConfig) {
+     Serial.println("saving config");
+     DynamicJsonBuffer jsonBuffer;
+     JsonObject& json = jsonBuffer.createObject();
+     json["server_ip_str"] = server_ip.getValue();
+     json["server_url_str"] = server_url.getValue();
+     json["server_port_str"] = server_port.getValue();
+     json["node_id_str"] = node_id.getValue();
+
+     File configFile = SPIFFS.open("/config.json", "w");
+     if (!configFile) {
+       Serial.println("failed to open config file for writing");
+     }
+
+     json.printTo(Serial);
+     json.printTo(configFile);
+     configFile.close();
+     //end save
+   }
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Databox init");
+
+  Serial.println( ESP_ID );
+
+  pinMode(CFG_BUTT,INPUT_PULLUP);
+  pinMode(CFG_LED,OUTPUT);
+  pinMode(PIR_IN,INPUT);
+
+  for(int x=0;x<10;x++){
+      digitalWrite(CFG_LED,1);
+      delay(100);
+      digitalWrite(CFG_LED,0);
+      delay(100);
+  }
+
+  int cfg = !digitalRead(CFG_BUTT);
+  if (cfg){
+    Serial.println("COnfig button pressed setting up wifi");
+    setUpWifi(false,true);  // use existing
+  }else{
+    setUpWifi(false,false);  // use existing
+  }
+
+  sendToEventServer(getNodeID(RST_ID),1);
+
+  for(int x=0;x<10;x++){
+      digitalWrite(CFG_LED,1);
+      delay(150);
+      digitalWrite(CFG_LED,0);
+      delay(50);
+  }
+
+  sendToEventServer(getNodeID(RST_ID),0);
+  digitalWrite(CFG_LED,1);
+
+  Wire.pins(2, 5);
+  lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+
+  #ifdef USE_2320
+  am2320.begin(2,5);
+  #endif
+
+}
